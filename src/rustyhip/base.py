@@ -323,9 +323,10 @@ class RustyhipCursor:
         self.description = (
             [(name, None, None, None, None, None, None) for name in columns] if columns else None
         )
-        # Default to "readonly" when the server omits the flag — a missing key
-        # should not make us silently report write stats for a SELECT.
-        if data.get("readonly", True):
+        # Default to `readonly = False` when the server omits the flag — a
+        # write that loses its `rowcount` silently is worse than a SELECT that
+        # reports 0 instead of len(rows) (len is typically 0 on writes anyway).
+        if data.get("readonly", False):
             self.rowcount = len(self._rows)
         else:
             self.rowcount = int(data.get("rowcount") or 0)
