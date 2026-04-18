@@ -16,7 +16,9 @@ from typing import Any, Iterable, Iterator
 
 from django.db.backends.sqlite3 import base as sqlite3_base
 
+from .creation import DatabaseCreation
 from .features import DatabaseFeatures
+from .operations import DatabaseOperations
 
 logger = logging.getLogger("rustyhip")
 
@@ -222,11 +224,11 @@ class RustyhipCursor:
         return self
 
     def _intercept_pragma(self, sql: str) -> bool:
-        """Handle PRAGMAs client-side. Our remote server opens a fresh SQLite
-        connection per /sql call, so setter pragmas (``PRAGMA x = ...``) would
-        never stick. Reader pragmas that Django inspects (notably
-        ``PRAGMA foreign_keys``) get synthetic answers so the SQLite schema
-        editor proceeds.
+        """Handle PRAGMAs client-side where turbolite or our HTTP model can't
+        honor them correctly. Most PRAGMAs (including setters like
+        ``PRAGMA foreign_keys = OFF``) pass through — rustyhip holds a
+        long-lived connection on the server, so setter state persists across
+        /sql calls.
 
         Returns True if the pragma was handled locally; False if the caller
         should fall through to the HTTP POST.
@@ -235,21 +237,11 @@ class RustyhipCursor:
         if not m:
             return False
         name = m.group("name").lower()
-        is_setter = m.group("value") is not None
-        if is_setter:
-            # Swallow all PRAGMA writes — they don't persist across /sql calls.
-            self._reset_result()
-            return True
-        if name == "foreign_keys":
-            # Report FK as OFF — rustyhip doesn't enforce FK across calls anyway.
-            self._rows = [(0,)]
-            self._row_iter = iter(self._rows)
-            self.description = [("foreign_keys", None, None, None, None, None, None)]
-            self.rowcount = 1
-            self.lastrowid = None
-            return True
         if name == "foreign_key_check":
-            # Report no violations — we're not enforcing FK at the rustyhip layer.
+            # Report no violations. Django's schema editor calls this at the
+            # end of every migration; SQLite's answer is a row per broken FK.
+            # We're not enforcing FK across connections, so an empty result
+            # is the honest answer.
             self._rows = []
             self._row_iter = iter(self._rows)
             self.description = [
@@ -261,7 +253,7 @@ class RustyhipCursor:
             self.rowcount = 0
             self.lastrowid = None
             return True
-        # Other reader pragmas go through (e.g., `PRAGMA table_info(...)` for introspection).
+        # Everything else — setters and readers — pass through to rustyhip.
         return False
 
     def executemany(self, sql: str, seq_of_params: Iterable[Iterable[Any]]) -> "RustyhipCursor":
@@ -419,6 +411,8 @@ class DatabaseWrapper(sqlite3_base.DatabaseWrapper):
     vendor = "sqlite"
     display_name = "Rustyhip"
     features_class = DatabaseFeatures
+    creation_class = DatabaseCreation
+    ops_class = DatabaseOperations
 
     def get_connection_params(self) -> dict[str, Any]:
         conf = self.settings_dict
