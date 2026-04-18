@@ -13,9 +13,12 @@ mechanism is visible to anyone reading Django's abstractions.
 
 from __future__ import annotations
 
-from typing import Iterable
+from typing import TYPE_CHECKING
 
 from django.db.backends.sqlite3.operations import DatabaseOperations as SqliteOperations
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
 
 
 class DatabaseOperations(SqliteOperations):

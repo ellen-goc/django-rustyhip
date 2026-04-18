@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-and-test:
+    name: ruff + pyright + pytest (py${{ matrix.python }}, django ${{ matrix.django }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+        django: ["4.2", "5.2", "6.0"]
+        exclude:
+          # Django 6.0 requires Python 3.12+
+          - python: "3.11"
+            django: "6.0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install deps (pinned Django)
+        run: |
+          uv sync --group dev
+          uv pip install "django~=${{ matrix.django }}.0"
+      - name: ruff check
+        run: uv run ruff check src/ tests/
+      - name: ruff format --check
+        run: uv run ruff format --check src/ tests/
+      - name: pyright
+        run: uv run pyright src/
+      - name: pytest
+        run: uv run pytest -q
