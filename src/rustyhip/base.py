@@ -304,7 +304,12 @@ class RustyhipCursor:
         try:
             data = json.loads(raw.decode("utf-8")) if raw else {}
         except json.JSONDecodeError as e:
-            raise OperationalError(f"rustyhip returned non-JSON body (status={status}): {raw!r}") from e
+            # Cap the offending body in the exception so a 500 HTML error page
+            # doesn't blow up the log / traceback with megabytes of output.
+            snippet = raw[:500]
+            raise OperationalError(
+                f"rustyhip returned non-JSON body (status={status}, first {len(snippet)} bytes): {snippet!r}"
+            ) from e
 
         if status >= 400:
             _raise_for_sql_error(status, data)
@@ -318,11 +323,15 @@ class RustyhipCursor:
         self.description = (
             [(name, None, None, None, None, None, None) for name in columns] if columns else None
         )
-        if data.get("readonly"):
+        # Default to "readonly" when the server omits the flag — a missing key
+        # should not make us silently report write stats for a SELECT.
+        if data.get("readonly", True):
             self.rowcount = len(self._rows)
         else:
             self.rowcount = int(data.get("rowcount") or 0)
         lastrowid = data.get("lastrowid")
+        # SQLite rowids are always positive integers; `0` means "no insert ran
+        # yet" and is surfaced as None so callers don't key off a fake rowid.
         self.lastrowid = int(lastrowid) if lastrowid else None
 
 
