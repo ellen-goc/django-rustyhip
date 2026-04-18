@@ -10,11 +10,26 @@ from __future__ import annotations
 import json
 import logging
 import re
+import sqlite3
 import urllib.error
 import urllib.request
+from sqlite3 import (
+    DatabaseError,
+    DataError,
+    Error,
+    IntegrityError,
+    InterfaceError,
+    InternalError,
+    NotSupportedError,
+    OperationalError,
+    ProgrammingError,
+    Warning,
+)
 from typing import Any, Iterable, Iterator
 
+from django.core.serializers.json import DjangoJSONEncoder
 from django.db.backends.sqlite3 import base as sqlite3_base
+from django.db.backends.sqlite3.base import FORMAT_QMARK_REGEX
 
 from .creation import DatabaseCreation
 from .features import DatabaseFeatures
@@ -22,15 +37,13 @@ from .operations import DatabaseOperations
 
 logger = logging.getLogger("rustyhip")
 
+# Matches a full PRAGMA statement. Non-greedy on the value so trailing
+# semicolons / whitespace don't get captured; callers only need the name
+# and whether a `=` assignment was present.
 _PRAGMA_RE = re.compile(
     r"^\s*PRAGMA\s+(?P<name>\w+)\s*(?:=\s*(?P<value>.+?))?\s*;?\s*$",
     re.IGNORECASE,
 )
-
-# Matches a `%s` placeholder that is NOT part of a literal `%%s`. Mirrors
-# Django's own SQLiteCursorWrapper.FORMAT_QMARK_REGEX — when params are
-# present we rewrite these to SQLite's `?` qmark style before POSTing.
-_FORMAT_QMARK_RE = re.compile(r"(?<!%)%s")
 
 # SQL statements that our server-side connection can't honor (no cross-call
 # transaction state — each /sql call opens a fresh SQLite connection). We
@@ -44,51 +57,18 @@ _TRANSACTION_KEYWORDS = (
     "RELEASE",
 )
 
-
-class Error(Exception):
-    """Base DB-API exception."""
-
-
-class Warning(Exception):  # noqa: N818  (DB-API requires this exact name)
-    pass
-
-
-class InterfaceError(Error):
-    pass
-
-
-class DatabaseError(Error):
-    pass
-
-
-class DataError(DatabaseError):
-    pass
-
-
-class OperationalError(DatabaseError):
-    pass
-
-
-class IntegrityError(DatabaseError):
-    pass
-
-
-class InternalError(DatabaseError):
-    pass
-
-
-class ProgrammingError(DatabaseError):
-    pass
-
-
-class NotSupportedError(DatabaseError):
-    pass
+# `Connection.getlimit(limit_id)` values from the SQLite C API — stdlib's
+# ``sqlite3`` module doesn't re-export them as named constants.
+_SQLITE_LIMIT_VARIABLE_NUMBER = 9
 
 
 class Database:
     """Stand-in for Python's ``sqlite3`` module. Django calls
     ``DatabaseWrapper.Database.connect(...)`` to build a connection — we return
     an HTTP-backed one instead.
+
+    Exception classes and PARSE_* constants are re-exported from the stdlib
+    ``sqlite3`` module so Django's DB-API expectations line up exactly.
     """
 
     Error = Error
@@ -102,10 +82,8 @@ class Database:
     ProgrammingError = ProgrammingError
     NotSupportedError = NotSupportedError
 
-    # Django's SQLite backend references these at import time. Real sqlite3
-    # defines them as ints; they don't affect us, just need to exist.
-    PARSE_DECLTYPES = 1
-    PARSE_COLNAMES = 2
+    PARSE_DECLTYPES = sqlite3.PARSE_DECLTYPES
+    PARSE_COLNAMES = sqlite3.PARSE_COLNAMES
 
     apilevel = "2.0"
     threadsafety = 1
@@ -171,7 +149,7 @@ class RustyhipConnection:
         SQLite's compile-time default so Django picks a reasonable batch size.
         """
         # SQLITE_LIMIT_VARIABLE_NUMBER — default 999 pre-3.32, 32766 since.
-        if limit_id == 9:
+        if limit_id == _SQLITE_LIMIT_VARIABLE_NUMBER:
             return 999
         return 0
 
@@ -305,7 +283,7 @@ class RustyhipCursor:
         self.description = None
 
     def _post(self, payload: dict[str, Any]) -> dict[str, Any]:
-        body = json.dumps(payload, default=_json_default).encode("utf-8")
+        body = json.dumps(payload, cls=_RustyhipJSONEncoder).encode("utf-8")
         req = urllib.request.Request(  # noqa: S310  (endpoint is operator-configured)
             f"{self.conn.endpoint}/sql",
             data=body,
@@ -329,8 +307,7 @@ class RustyhipCursor:
             raise OperationalError(f"rustyhip returned non-JSON body (status={status}): {raw!r}") from e
 
         if status >= 400:
-            msg = data.get("error") if isinstance(data, dict) else str(data)
-            _raise_for_sql_error(status, msg or f"rustyhip returned HTTP {status}")
+            _raise_for_sql_error(status, data)
         return data
 
     def _ingest(self, data: dict[str, Any]) -> None:
@@ -376,29 +353,65 @@ def _convert_format_to_qmark(sql: str) -> str:
 
     Django's ORM compiles SQL using ``%s`` positional markers; Python's
     sqlite3 module uses ``?``. The built-in SQLite cursor wrapper rewrites
-    placeholders at execute time. We do the same for parity.
+    placeholders at execute time; we reuse its exact regex for parity.
     """
-    return _FORMAT_QMARK_RE.sub("?", sql).replace("%%", "%")
+    return FORMAT_QMARK_REGEX.sub("?", sql).replace("%%", "%")
 
 
-def _json_default(value: Any) -> Any:
-    # Django passes datetime / date / Decimal etc. through the cursor. Python's
-    # sqlite3 module would stringify via registered adapters — we do the same
-    # with a plain str() fallback, which SQLite treats as TEXT.
-    if isinstance(value, (bytes, bytearray, memoryview)):
-        # SQLite BLOB round-trip isn't supported by rustyhip today.
-        raise NotSupportedError("rustyhip backend does not yet support BLOB parameters")
-    return str(value)
+class _RustyhipJSONEncoder(DjangoJSONEncoder):
+    """``DjangoJSONEncoder`` handles ``datetime``, ``date``, ``time``,
+    ``timedelta``, ``Decimal``, ``UUID``, and ``Promise`` natively. We only
+    need to extend it with an explicit rejection of BLOB-style values —
+    rustyhip doesn't round-trip bytes through its JSON wire format yet.
+    """
+
+    def default(self, o: Any) -> Any:
+        if isinstance(o, (bytes, bytearray, memoryview)):
+            raise NotSupportedError("rustyhip backend does not yet support BLOB parameters")
+        return super().default(o)
 
 
-def _raise_for_sql_error(status: int, msg: str) -> None:
-    lowered = msg.lower()
-    if "unique" in lowered or "constraint" in lowered:
-        raise IntegrityError(msg)
-    if "syntax" in lowered or "no such" in lowered:
-        raise ProgrammingError(msg)
-    if status == 400:
+# Rustyhip's server-side codes (src/errors.rs) — keep in sync with the Rust side.
+_SERVER_ERROR_UNAUTHORIZED = "RUSTYHIP_E_UNAUTHORIZED"
+_SERVER_ERROR_VALIDATION = "RUSTYHIP_E_VALIDATION"
+_SERVER_ERROR_NOT_FOUND = "RUSTYHIP_E_NOT_FOUND"
+_SERVER_ERROR_SQL = "RUSTYHIP_E_SQL"
+_SERVER_ERROR_INTERNAL = "RUSTYHIP_E_INTERNAL"
+
+
+def _raise_for_sql_error(status: int, data: Any) -> None:
+    """Map a rustyhip error response to the appropriate DB-API exception.
+
+    Rustyhip returns ``{"error": {"code": "RUSTYHIP_E_*", "message": "...",
+    "request_id": "..."}}`` on every non-2xx. The code tells us the category;
+    for the catch-all ``RUSTYHIP_E_SQL`` we fall back to message-substring
+    matching to distinguish ``IntegrityError`` (unique / FK violations) from
+    ``ProgrammingError`` (syntax / missing tables).
+    """
+    err = data.get("error") if isinstance(data, dict) else None
+    if isinstance(err, dict):
+        code = err.get("code")
+        msg = err.get("message") or ""
+    else:
+        code = None
+        msg = str(err or data or f"rustyhip returned HTTP {status}")
+
+    if code == _SERVER_ERROR_UNAUTHORIZED:
+        raise ProgrammingError(f"rustyhip auth rejected: {msg}")
+    if code == _SERVER_ERROR_VALIDATION:
         raise OperationalError(msg)
+    if code == _SERVER_ERROR_NOT_FOUND:
+        raise ProgrammingError(msg)
+    if code == _SERVER_ERROR_INTERNAL:
+        raise OperationalError(msg)
+    if code == _SERVER_ERROR_SQL:
+        lowered = msg.lower()
+        if "unique" in lowered or "constraint" in lowered:
+            raise IntegrityError(msg)
+        if "syntax" in lowered or "no such" in lowered:
+            raise ProgrammingError(msg)
+        raise OperationalError(msg)
+    # Old servers or unexpected shapes — preserve the status for callers.
     raise DatabaseError(f"HTTP {status}: {msg}")
 
 
