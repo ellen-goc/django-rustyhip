@@ -25,7 +25,7 @@ from sqlite3 import (
     ProgrammingError,
     Warning,
 )
-from typing import Any, Iterable, Iterator
+from typing import TYPE_CHECKING, Any
 
 from django.core.serializers.json import DjangoJSONEncoder
 from django.db.backends.sqlite3 import base as sqlite3_base
@@ -34,6 +34,9 @@ from django.db.backends.sqlite3.base import FORMAT_QMARK_REGEX
 from .creation import DatabaseCreation
 from .features import DatabaseFeatures
 from .operations import DatabaseOperations
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable, Iterator
 
 logger = logging.getLogger("rustyhip")
 
@@ -90,7 +93,7 @@ class Database:
     paramstyle = "qmark"
 
     @staticmethod
-    def connect(endpoint: str, timeout: float = 30.0, **_: Any) -> "RustyhipConnection":
+    def connect(endpoint: str, timeout: float = 30.0, **_: Any) -> RustyhipConnection:
         return RustyhipConnection(endpoint=endpoint, timeout=timeout)
 
     @staticmethod
@@ -119,16 +122,16 @@ class RustyhipConnection:
         self.in_transaction = False
         self.row_factory: Any = None
 
-    def cursor(self, factory: Any = None) -> "RustyhipCursor":
+    def cursor(self, factory: Any = None) -> RustyhipCursor:
         return RustyhipCursor(self)
 
     # Convenience passthrough used by Django for a couple of pragmas at connect time.
-    def execute(self, sql: str, params: Iterable[Any] | None = None) -> "RustyhipCursor":
+    def execute(self, sql: str, params: Iterable[Any] | None = None) -> RustyhipCursor:
         cur = self.cursor()
         cur.execute(sql, params or ())
         return cur
 
-    def executemany(self, sql: str, seq_of_params: Iterable[Iterable[Any]]) -> "RustyhipCursor":
+    def executemany(self, sql: str, seq_of_params: Iterable[Iterable[Any]]) -> RustyhipCursor:
         cur = self.cursor()
         cur.executemany(sql, seq_of_params)
         return cur
@@ -163,7 +166,7 @@ class RustyhipConnection:
         self.closed = True
 
     # Context manager protocol (sqlite3.Connection is one).
-    def __enter__(self) -> "RustyhipConnection":
+    def __enter__(self) -> RustyhipConnection:
         return self
 
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
@@ -187,7 +190,7 @@ class RustyhipCursor:
         self.lastrowid: int | None = None
         self.description: list[tuple[str, None, None, None, None, None, None]] | None = None
 
-    def execute(self, sql: str, params: Iterable[Any] | None = None) -> "RustyhipCursor":
+    def execute(self, sql: str, params: Iterable[Any] | None = None) -> RustyhipCursor:
         if _is_transaction_stmt(sql):
             # Silently succeed — we fake client-side transaction management.
             self._reset_result()
@@ -234,7 +237,7 @@ class RustyhipCursor:
         # Everything else — setters and readers — pass through to rustyhip.
         return False
 
-    def executemany(self, sql: str, seq_of_params: Iterable[Iterable[Any]]) -> "RustyhipCursor":
+    def executemany(self, sql: str, seq_of_params: Iterable[Iterable[Any]]) -> RustyhipCursor:
         total_rowcount = 0
         for params in seq_of_params:
             self.execute(sql, params)
@@ -320,9 +323,7 @@ class RustyhipCursor:
         rows_raw = data.get("rows") or []
         self._rows = [tuple(row.get(col) for col in columns) for row in rows_raw]
         self._row_iter = iter(self._rows)
-        self.description = (
-            [(name, None, None, None, None, None, None) for name in columns] if columns else None
-        )
+        self.description = [(name, None, None, None, None, None, None) for name in columns] if columns else None
         # Default to `readonly = False` when the server omits the flag — a
         # write that loses its `rowcount` silently is worse than a SELECT that
         # reports 0 instead of len(rows) (len is typically 0 on writes anyway).
@@ -443,8 +444,7 @@ class DatabaseWrapper(sqlite3_base.DatabaseWrapper):
         endpoint = options.get("endpoint") or options.get("ENDPOINT")
         if not endpoint:
             raise ImproperlyConfigured(
-                "django-rustyhip requires DATABASES['default']['OPTIONS']['endpoint'] "
-                "(e.g. 'http://localhost:9000')."
+                "django-rustyhip requires DATABASES['default']['OPTIONS']['endpoint'] (e.g. 'http://localhost:9000')."
             )
         return {
             "endpoint": endpoint,
@@ -462,6 +462,10 @@ class DatabaseWrapper(sqlite3_base.DatabaseWrapper):
         return None
 
     def create_cursor(self, name: str | None = None) -> RustyhipCursor:
+        # Django guarantees ``self.connection`` is set by the time `create_cursor`
+        # is called (it goes through `ensure_connection` upstream). The type
+        # hint on the base class is `Optional`, hence the explicit assert.
+        assert self.connection is not None
         return self.connection.cursor()
 
     def _set_autocommit(self, autocommit: bool) -> None:
