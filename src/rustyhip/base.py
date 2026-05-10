@@ -441,10 +441,10 @@ class DatabaseWrapper(sqlite3_base.DatabaseWrapper):
     def get_connection_params(self) -> dict[str, Any]:
         conf = self.settings_dict
         options = conf.get("OPTIONS") or {}
-        endpoint = options.get("endpoint") or options.get("ENDPOINT")
+        endpoint = options.get("endpoint") or options.get("ENDPOINT") or conf.get("HOST")
         if not endpoint:
             raise ImproperlyConfigured(
-                "django-rustyhip requires DATABASES['default']['OPTIONS']['endpoint'] (e.g. 'http://localhost:9000')."
+                "django-rustyhip requires DATABASES[...]['HOST'] or OPTIONS['endpoint'] (e.g. 'http://localhost:9000')."
             )
         return {
             "endpoint": endpoint,
